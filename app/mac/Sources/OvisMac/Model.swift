@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UserNotifications
 
 private final class NoRedirects: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -12,6 +13,12 @@ private final class InstallerRedirects: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         completionHandler(request.url.map(Ovis.isInstallerSource) == true ? request : nil)
     }
+}
+
+/// Which kind of server the main window is connected to.
+enum ServerKind: Equatable {
+    case local
+    case remote(id: String)
 }
 
 struct Status: Equatable {
@@ -64,6 +71,10 @@ final class Model: ObservableObject {
     @Published private(set) var webOrigin: URL?
     @Published private(set) var reloads = 0
     @Published var phoneSetupRequested = false
+    /// The kind of server currently shown in the main window.
+    @Published var serverKind: ServerKind = .local
+    /// The remote server being shown, if any.
+    @Published var remoteServer: ServerStore.Server?
     weak var page: WebPageController?
     private(set) var carriedDrafts: [String: String] = [:]
     private var pageFailedToLoad = false
@@ -115,8 +126,20 @@ final class Model: ObservableObject {
     /// now, or stopped, and then the window shows Start.
     func monitor() async {
         var misses = 0
+        var lastAppState = NSApplication.shared.applicationState
         while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            // Adaptive sleep: longer when app is in background, shorter when active
+            let isActive = NSApplication.shared.applicationState == .active
+            let sleepInterval: UInt64 = isActive ? 3_000_000_000 : 30_000_000_000 // 3s active, 30s background
+            try? await Task.sleep(nanoseconds: sleepInterval)
+
+            // Skip monitoring if app is in background and we're just monitoring local server
+            if !isActive && phase == .installed && serverKind == .local && status?.running == true {
+                // For local server, we don't need frequent checks when app is hidden
+                // The launch agent will keep it running
+                continue
+            }
+
             guard phase == .installed || phase == .notInstalled else {
                 misses = 0
                 continue
@@ -165,12 +188,80 @@ final class Model: ObservableObject {
         if let url = [page?.webView.url, webOrigin, status?.origin].compactMap({ $0 }).first(where: Status.isWeb) { open(url) }
     }
 
+    /// Whether push notifications are currently subscribed for the current server.
+    var isPushSubscribed: Bool {
+        getPushSubscription() != nil
+    }
+
+    /// Toggle push notifications for the current server.
+    func togglePushNotifications() async {
+        if isPushSubscribed {
+            unsubscribeFromPush()
+        } else {
+            // Get VAPID public key from server
+            guard let origin = webOrigin else { return }
+            do {
+                let url = URL(string: "api/push/vapid", relativeTo: origin)!
+                let (data, response) = try await URLSession.shared.data(from: url, delegate: NoRedirects())
+                guard (response as? HTTPURLResponse)?.statusCode == 200,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let vapidKey = json["public_key"] as? String else { return }
+                await subscribeToPush(applicationServerKey: vapidKey)
+            } catch {
+                // Failed to get VAPID key
+            }
+        }
+    }
+
     func retry() async {
         switch retryAction {
         case .install: await install()
         case .restart: await restart()
         case .phone: await makePhoneAddress()
         case .remove: await uninstall()
+        }
+    }
+
+    /// Open a remote server from a relay offer URL (e.g., from a pairing link).
+    func openRemoteOffer(_ urlString: String) async {
+        work += 1
+        log = []
+        phase = .working(L("Connecting to remote server…", "원격 서버에 연결하는 중…"))
+
+        guard let url = URL(string: urlString),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: true),
+              let fragment = components.fragment,
+              fragment.hasPrefix("offer=") else {
+            fail(L("Invalid pairing link.", "유효하지 않은 페어링 링크입니다."))
+            return
+        }
+
+        let payload = String(fragment.dropFirst(6))
+        guard let data = Data(base64URLEncoded: payload),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let serverId = json["server_id"] as? String,
+              let serverPublicKey = json["server_public_key"] as? String,
+              let relay = json["relay"] as? String else {
+            fail(L("Invalid pairing link format.", "페어링 링크 형식이 올바르지 않습니다."))
+            return
+        }
+
+        // The origin for the hosted shell
+        let origin = "https://app.ovis.sh/s/\(serverId)/"
+
+        if await answers(URL(string: origin)!) {
+            await MainActor.run {
+                self.webOrigin = URL(string: origin)!
+                self.serverKind = .remote(id: serverId)
+                if let server = ServerStore.server(id: serverId) {
+                    self.remoteServer = server
+                }
+                self.phase = .installed
+                self.pageFailedToLoad = false
+                ServerStore.use(serverId)
+            }
+        } else {
+            fail(L("Could not reach the remote server. Check your internet connection.", "원격 서버에 도달할 수 없습니다. 인터넷 연결을 확인하세요."))
         }
     }
 
@@ -493,6 +584,96 @@ final class Model: ObservableObject {
         return body["ok"] as? Bool == true && body["bridge_protocol"] is Int
     }
 
+    // MARK: - Push Notifications
+
+    /// Register for push notifications with the current server.
+    func subscribeToPush(applicationServerKey: String) async {
+        guard let origin = webOrigin else { return }
+        guard let vapidKey = Data(base64URLEncoded: applicationServerKey),
+              vapidKey.count == 65, vapidKey.first == 4 else { return }
+
+        // Request notification permission
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        if settings.authorizationStatus == .notDetermined {
+            _ = try? await center.requestAuthorization(options: [.alert, .sound])
+        }
+        let updatedSettings = await center.notificationSettings()
+        guard updatedSettings.authorizationStatus == .authorized else { return }
+
+        // Get or create push keys
+        let keys = PushKeyStore.getOrCreate()
+        guard let keys else { return }
+
+        // Get APNs device token
+        let token = await PushKeyStore.deviceToken()
+        guard let token else { return }
+
+        // Determine APNs environment
+        let environment = PushKeyStore.apnsEnvironment()
+
+        // Check if we have a saved endpoint for this origin
+        let storageKey = "ovis.push.endpoint.\(origin.absoluteString)"
+        if let savedData = UserDefaults.standard.data(forKey: storageKey),
+           let saved = try? JSONDecoder().decode(PushEndpoint.self, from: savedData),
+           saved.token == token, saved.vapidKey == applicationServerKey,
+           saved.environment == environment {
+            // Already subscribed with same params
+            return
+        }
+
+        // Register with relay
+        if let endpoint = await registerPushEndpoint(token: token, vapidKey: applicationServerKey, environment: environment) {
+            let entry = PushEndpoint(endpoint: endpoint, token: token, vapidKey: applicationServerKey, environment: environment)
+            UserDefaults.standard.set(try? JSONEncoder().encode(entry), forKey: storageKey)
+        }
+    }
+
+    private func registerPushEndpoint(token: String, vapidKey: String, environment: String) async -> String? {
+        guard let origin = webOrigin else { return nil }
+        let relay = "https://push.ovis.sh"
+        guard let url = URL(string: relay + "/v1/register") else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "token": token, "environment": environment, "vapid_key": vapidKey
+        ])
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 201,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let endpoint = json["endpoint"] as? String,
+                  endpoint.hasPrefix(relay + "/v1/push/") else { return nil }
+            return endpoint
+        } catch {
+            return nil
+        }
+    }
+
+    /// Unsubscribe from push notifications for the current server.
+    func unsubscribeFromPush() {
+        guard let origin = webOrigin else { return }
+        let storageKey = "ovis.push.endpoint.\(origin.absoluteString)"
+        UserDefaults.standard.removeObject(forKey: storageKey)
+    }
+
+    /// Get current push subscription for the current server.
+    func getPushSubscription() -> PushSubscription? {
+        guard let origin = webOrigin else { return nil }
+        let storageKey = "ovis.push.endpoint.\(origin.absoluteString)"
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let saved = try? JSONDecoder().decode(PushEndpoint.self, from: data),
+              let keys = PushKeyStore.read() else { return nil }
+        return PushSubscription(
+            endpoint: saved.endpoint,
+            keys: PushKeys(
+                p256dh: keys.publicPoint.base64URLEncodedString(),
+                auth: keys.auth.base64URLEncodedString()
+            )
+        )
+    }
+
     private func herdrRunning() async -> Bool {
         let result = await run(Paths.herdr, ["status", "server", "--json"], keepStderr: false, timeout: 10)
         return result.output.contains("\"running\":true")
@@ -517,6 +698,182 @@ final class Model: ObservableObject {
                    "Ovis 서버가 2분 안에 시작되지 않았습니다. 다시 시도하거나, 오류 내용을 복사해 도움을 받으세요."),
                  detail: logTail)
         }
+    }
+
+    /// Switch to a remote server by its ID.
+    func connectToRemoteServer(_ server: ServerStore.Server) async {
+        work += 1
+        log = []
+        phase = .working(L("Connecting to \(server.name)…", "\(server.name)에 연결하는 중…"))
+
+        guard let origin = URL(string: server.origin) else {
+            fail(L("Invalid server address.", "잘못된 서버 주소입니다."))
+            return
+        }
+
+        // Verify the server answers as Ovis
+        if await answers(origin) {
+            await MainActor.run {
+                self.webOrigin = origin
+                self.serverKind = .remote(id: server.id)
+                self.remoteServer = server
+                self.phase = .installed
+                self.pageFailedToLoad = false
+                ServerStore.use(server.id)
+            }
+        } else {
+            fail(L("Could not reach \(server.name). Check your internet connection and try again.",
+                   "\(server.name)에 도달할 수 없습니다. 인터넷 연결을 확인하고 다시 시도해 주세요."))
+        }
+    }
+
+    /// Switch back to the local server.
+    func switchToLocal() async {
+        await refresh()
+    }
+
+    /// Remove a remote server from the list.
+    func removeRemoteServer(_ id: String) {
+        ServerStore.remove(id)
+        if case .remote(let currentId) = serverKind, currentId == id {
+            // If we're viewing the removed server, switch back to local
+            Task { await switchToLocal() }
+        }
+    }
+}
+
+// MARK: - Push Notification Types
+
+struct PushEndpoint: Codable {
+    let endpoint: String
+    let token: String
+    let vapidKey: String
+    let environment: String
+}
+
+struct PushSubscription: Codable {
+    let endpoint: String
+    let keys: PushKeys
+}
+
+struct PushKeys: Codable {
+    let p256dh: String
+    let auth: String
+}
+
+// MARK: - Push Key Store
+
+/// Manages VAPID keys for push notifications (mirrors iOS PushKeyStore)
+struct PushKeyStore {
+    enum Failure: Error {
+        case keychain(OSStatus)
+        case damaged
+    }
+
+    private static let service = "sh.ovis.mac.push"
+    private static let account = "keys"
+
+    private static var query: [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+    }
+
+    static func read() -> PushKeyPair? {
+        var query = query
+        query[kSecReturnData as String] = true
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else { return nil }
+        guard let data = result as? Data else { return nil }
+        return decode(data)
+    }
+
+    static func getOrCreate() -> PushKeyPair? {
+        if let keys = read() { return keys }
+        return create()
+    }
+
+    private static func decode(_ data: Data) -> PushKeyPair? {
+        guard data.count == 48 else { return nil }
+        let scalar = Data(data.prefix(32))
+        let auth = Data(data.suffix(16))
+        do {
+            let privateKey = try P256.KeyAgreement.PrivateKey(rawRepresentation: scalar)
+            return PushKeyPair(privateKey: privateKey, auth: auth)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func create() -> PushKeyPair? {
+        var auth = Data(count: 16)
+        let status = auth.withUnsafeMutableBytes {
+            SecRandomCopyBytes(kSecRandomDefault, $0.count, $0.baseAddress!)
+        }
+        guard status == errSecSuccess else { return nil }
+        let privateKey = P256.KeyAgreement.PrivateKey()
+        let keys = PushKeyPair(privateKey: privateKey, auth: auth)
+        var query = query
+        query[kSecValueData as String] = privateKey.rawRepresentation + auth
+        let addStatus = SecItemAdd(query as CFDictionary, nil)
+        if addStatus == errSecDuplicateItem, let existing = read() { return existing }
+        guard addStatus == errSecSuccess else { return nil }
+        return keys
+    }
+
+    static func deviceToken() async -> String? {
+        await withCheckedContinuation { continuation in
+            PushNotificationDelegate.tokenContinuation = continuation
+            DispatchQueue.main.async {
+                NSApplication.shared.registerForRemoteNotifications(matching: [.alert, .sound])
+            }
+        }
+    }
+
+    static func apnsEnvironment() -> String {
+        #if targetEnvironment(simulator)
+        return "sandbox"
+        #else
+        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision") else {
+            return "production"
+        }
+        do {
+            let data = try Data(contentsOf: url)
+            guard let start = data.range(of: Data("<?xml".utf8)),
+                  let end = data.range(of: Data("</plist>".utf8)),
+                  let profile = try PropertyListSerialization.propertyList(
+                    from: data.subdata(in: start.lowerBound..<end.upperBound), format: nil
+                  ) as? [String: Any],
+                  let entitlements = profile["Entitlements"] as? [String: Any],
+                  let environment = entitlements["aps-environment"] as? String else {
+                return "production"
+            }
+            return environment == "development" ? "sandbox" : "production"
+        } catch {
+            return "production"
+        }
+        #endif
+    }
+}
+
+struct PushKeyPair {
+    let privateKey: P256.KeyAgreement.PrivateKey
+    let auth: Data
+
+    var publicPoint: Data { privateKey.publicKey.x963Representation }
+}
+
+extension Data {
+    func base64URLEncodedString() -> String {
+        self.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }
 

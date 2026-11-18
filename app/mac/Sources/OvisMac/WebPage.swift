@@ -61,6 +61,8 @@ final class WebPageController: NSObject, ObservableObject {
     @Published private(set) var state: State = .loading
     let webView: WKWebView
     private let origin: URL
+    /// The server_id if this is a remote server, nil for local.
+    private let remoteServerId: String?
     private weak var model: Model?
     private let isPopup: Bool
     private var window: NSWindow?
@@ -72,6 +74,79 @@ final class WebPageController: NSObject, ObservableObject {
     private var carryToken: String?
     private var carryShared = false
     private var carryBefore: [String: Any]?
+    private var wasActive = true
+
+    /// Create a controller for a local server (loopback origin).
+    convenience init(origin: URL, model: Model) {
+        self.init(origin: origin, model: model, remoteServerId: nil, popupConfiguration: nil)
+    }
+
+    /// Create a controller for a remote server.
+    convenience init(origin: URL, model: Model, remoteServerId: String) {
+        self.init(origin: origin, model: model, remoteServerId: remoteServerId, popupConfiguration: nil)
+    }
+
+    /// A popup gets the configuration WebKit hands over for it; the main window's page makes its own.
+    init(origin: URL, model: Model, remoteServerId: String?, popupConfiguration: WKWebViewConfiguration? = nil) {
+        self.origin = origin
+        self.remoteServerId = remoteServerId
+        self.model = model
+        isPopup = popupConfiguration != nil
+        webView = OvisWebView(frame: .zero, configuration: popupConfiguration ?? Self.configuration())
+        super.init()
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.underPageBackgroundColor = .windowBackgroundColor
+        // a popup is loaded by WebKit, with the request that opened it
+        guard !isPopup else { return }
+        model.page = self
+        reloads = model.$reloads.dropFirst().sink { [weak self] _ in self?.reload() }
+        // drafts go only to this Mac's own server, as they came only from it
+        if Self.isLoopback(origin) {
+            let shared = Self.popups.contains { !$0.closed && $0.webView.url.map(self.isOvis) == true }
+            let token = UUID().uuidString
+            if let script = Self.carryScript(model.carriedDrafts, shared: shared, token: token, loaded: false, before: nil) {
+                webView.configuration.userContentController.addUserScript(script)
+                webView.configuration.userContentController.add(CarryBaselines(page: self), name: "ovisCarry")
+                carryToken = token
+                carryShared = shared
+            }
+        }
+        webView.load(URLRequest(url: origin))
+
+        // Observe app activation state to pause/resume web view for CPU efficiency
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidBecomeActive),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillResignActive),
+            name: NSApplication.willResignActiveNotification,
+            object: nil
+        )
+    }
+
+    @objc private func appDidBecomeActive() {
+        wasActive = true
+        // Resume web view process if it was suspended
+        webView.process?.resume()
+    }
+
+    @objc private func appWillResignActive() {
+        wasActive = false
+        // Suspend web view process when app is not active to save CPU
+        // Only do this for remote servers; local server needs to stay responsive for herdr
+        if remoteServerId != nil {
+            webView.process?.suspend()
+        }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
 
     /// Nothing here is sent by itself; it waits in the page for the user's Send or Discard.
     /// A chat send on its way keeps its lease, as across a reload: until it runs out (2 minutes) the new
@@ -186,13 +261,35 @@ final class WebPageController: NSObject, ObservableObject {
     }
 
     private func isOvis(_ url: URL) -> Bool {
-        url.scheme?.lowercased() == origin.scheme?.lowercased() && url.host?.lowercased() == origin.host?.lowercased()
-            && Self.port(url.port, scheme: url.scheme) == Self.port(origin.port, scheme: origin.scheme)
+        // For local servers: same origin check
+        // For remote servers: allow navigation within the /s/<server_id>/ scope
+        if let serverId = remoteServerId {
+            // Remote server: must be on app.ovis.sh and within /s/<server_id>/ scope
+            guard url.scheme?.lowercased() == "https",
+                  url.host?.lowercased() == "app.ovis.sh",
+                  let path = URLComponents(url: url, resolvingAgainstBaseURL: true)?.percentEncodedPath,
+                  path.hasPrefix("/s/\(serverId)/") else { return false }
+            return true
+        } else {
+            // Local server: same origin check
+            return url.scheme?.lowercased() == origin.scheme?.lowercased()
+                && url.host?.lowercased() == origin.host?.lowercased()
+                && Self.port(url.port, scheme: url.scheme) == Self.port(origin.port, scheme: origin.scheme)
+        }
     }
 
     private func isOvis(_ origin: WKSecurityOrigin) -> Bool {
-        origin.protocol.lowercased() == self.origin.scheme?.lowercased() && origin.host.lowercased() == self.origin.host?.lowercased()
-            && Self.port(origin.port, scheme: origin.protocol) == Self.port(self.origin.port, scheme: self.origin.scheme)
+        if let serverId = remoteServerId {
+            guard origin.protocol.lowercased() == "https",
+                  origin.host.lowercased() == "app.ovis.sh" else { return false }
+            // For WKSecurityOrigin we can't easily check path, so we'll be more permissive
+            // and let the URL check handle it
+            return true
+        } else {
+            return origin.protocol.lowercased() == self.origin.scheme?.lowercased()
+                && origin.host.lowercased() == self.origin.host?.lowercased()
+                && Self.port(origin.port, scheme: origin.protocol) == Self.port(self.origin.port, scheme: self.origin.scheme)
+        }
     }
 
     /// The port an address means: none (a URL) or 0 (WebKit's origin) is the scheme's own, which an
