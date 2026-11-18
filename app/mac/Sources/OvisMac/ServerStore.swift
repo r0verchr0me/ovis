@@ -9,7 +9,7 @@ final class ServerStore {
     private static let currentKey = "ovis.currentServer"
     private static let lastKey = "ovis.lastServer"
 
-    struct Server: Codable, Equatable {
+    struct Server: Codable, Equatable, Identifiable {
         let id: String          // The server_id from the relay offer
         let name: String        // User-friendly name
         let origin: String      // The base origin (e.g., "https://app.ovis.sh/s/<server_id>/")
@@ -27,7 +27,7 @@ final class ServerStore {
             guard let data = Data(base64URLEncoded: payload),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let serverId = json["server_id"] as? String,
-                  let relay = json["relay"] as? String else { return nil }
+                  let _ = json["relay"] as? String else { return nil }
 
             // The origin for the hosted shell is the app base + /s/<server_id>/
             let appBase = "https://app.ovis.sh"

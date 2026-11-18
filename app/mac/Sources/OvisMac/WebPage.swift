@@ -10,6 +10,10 @@ struct WebPage: View {
         _page = StateObject(wrappedValue: WebPageController(origin: origin, model: model))
     }
 
+    init(origin: URL, model: Model, remoteServerId: String) {
+        _page = StateObject(wrappedValue: WebPageController(origin: origin, model: model, remoteServerId: remoteServerId))
+    }
+
     var body: some View {
         ZStack {
             WebViewHost(webView: page.webView)

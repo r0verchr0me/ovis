@@ -148,7 +148,7 @@ private struct AddRemoteServerItem: View {
                             Text(L("Pairing Link", "페어링 링크")).font(.caption).foregroundStyle(.secondary)
                             TextField("https://app.ovis.sh/s/...#offer=...", text: $addServerURL)
                                 .textFieldStyle(.roundedBorder)
-                                .onChange(of: addServerURL) { _, _ in addServerError = "" }
+                                .onChange(of: addServerURL) { _ in addServerError = "" }
                         }
 
                         VStack(alignment: .leading, spacing: 6) {
@@ -395,7 +395,7 @@ struct ContentView: View {
                     Text(L("Pairing Link", "페어링 링크")).font(.caption).foregroundStyle(.secondary)
                     TextField("https://app.ovis.sh/s/...#offer=...", text: $addServerURL)
                         .textFieldStyle(.roundedBorder)
-                        .onChange(of: addServerURL) { _, _ in addServerError = "" }
+                        .onChange(of: addServerURL) { _ in addServerError = "" }
                 }
 
                 VStack(alignment: .leading, spacing: 6) {

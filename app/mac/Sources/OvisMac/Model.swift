@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import UserNotifications
+import CryptoKit
 
 private final class NoRedirects: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -126,10 +127,9 @@ final class Model: ObservableObject {
     /// now, or stopped, and then the window shows Start.
     func monitor() async {
         var misses = 0
-        var lastAppState = NSApplication.shared.applicationState
         while !Task.isCancelled {
-            // Adaptive sleep: longer when app is in background, shorter when active
-            let isActive = NSApplication.shared.applicationState == .active
+            // On macOS, we use a simpler approach: check if any window is key
+            let isActive = NSApplication.shared.keyWindow != nil
             let sleepInterval: UInt64 = isActive ? 3_000_000_000 : 30_000_000_000 // 3s active, 30s background
             try? await Task.sleep(nanoseconds: sleepInterval)
 
@@ -240,8 +240,8 @@ final class Model: ObservableObject {
         guard let data = Data(base64URLEncoded: payload),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let serverId = json["server_id"] as? String,
-              let serverPublicKey = json["server_public_key"] as? String,
-              let relay = json["relay"] as? String else {
+              let _ = json["server_public_key"] as? String,
+              let _ = json["relay"] as? String else {
             fail(L("Invalid pairing link format.", "페어링 링크 형식이 올바르지 않습니다."))
             return
         }
@@ -602,8 +602,7 @@ final class Model: ObservableObject {
         guard updatedSettings.authorizationStatus == .authorized else { return }
 
         // Get or create push keys
-        let keys = PushKeyStore.getOrCreate()
-        guard let keys else { return }
+        guard PushKeyStore.getOrCreate() != nil else { return }
 
         // Get APNs device token
         let token = await PushKeyStore.deviceToken()
@@ -630,7 +629,7 @@ final class Model: ObservableObject {
     }
 
     private func registerPushEndpoint(token: String, vapidKey: String, environment: String) async -> String? {
-        guard let origin = webOrigin else { return nil }
+        _ = webOrigin // origin not needed for relay registration
         let relay = "https://push.ovis.sh"
         guard let url = URL(string: relay + "/v1/register") else { return nil }
         var request = URLRequest(url: url, timeoutInterval: 15)
@@ -803,7 +802,7 @@ struct PushKeyStore {
         let scalar = Data(data.prefix(32))
         let auth = Data(data.suffix(16))
         do {
-            let privateKey = try P256.KeyAgreement.PrivateKey(rawRepresentation: scalar)
+            let privateKey = try P256.Signing.PrivateKey(rawRepresentation: scalar)
             return PushKeyPair(privateKey: privateKey, auth: auth)
         } catch {
             return nil
@@ -816,7 +815,7 @@ struct PushKeyStore {
             SecRandomCopyBytes(kSecRandomDefault, $0.count, $0.baseAddress!)
         }
         guard status == errSecSuccess else { return nil }
-        let privateKey = P256.KeyAgreement.PrivateKey()
+        let privateKey = P256.Signing.PrivateKey()
         let keys = PushKeyPair(privateKey: privateKey, auth: auth)
         var query = query
         query[kSecValueData as String] = privateKey.rawRepresentation + auth
@@ -862,7 +861,7 @@ struct PushKeyStore {
 }
 
 struct PushKeyPair {
-    let privateKey: P256.KeyAgreement.PrivateKey
+    let privateKey: P256.Signing.PrivateKey
     let auth: Data
 
     var publicPoint: Data { privateKey.publicKey.x963Representation }
