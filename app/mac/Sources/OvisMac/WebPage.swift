@@ -95,8 +95,8 @@ final class WebPageController: NSObject, ObservableObject {
         self.origin = origin
         self.remoteServerId = remoteServerId
         self.model = model
-        isPopup = popupConfiguration != nil
-        webView = OvisWebView(frame: .zero, configuration: popupConfiguration ?? Self.configuration())
+        self.isPopup = popupConfiguration != nil
+        self.webView = OvisWebView(frame: .zero, configuration: popupConfiguration ?? Self.configuration())
         super.init()
         webView.navigationDelegate = self
         webView.uiDelegate = self
