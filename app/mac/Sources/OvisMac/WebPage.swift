@@ -159,6 +159,7 @@ final class WebPageController: NSObject, ObservableObject {
     /// A popup gets the configuration WebKit hands over for it; the main window's page makes its own.
     init(origin: URL, model: Model, popupConfiguration: WKWebViewConfiguration? = nil) {
         self.origin = origin
+        self.remoteServerId = nil
         self.model = model
         isPopup = popupConfiguration != nil
         webView = OvisWebView(frame: .zero, configuration: popupConfiguration ?? Self.configuration())
