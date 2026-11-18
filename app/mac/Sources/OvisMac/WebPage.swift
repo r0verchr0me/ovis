@@ -131,17 +131,16 @@ final class WebPageController: NSObject, ObservableObject {
 
     @objc private func appDidBecomeActive() {
         wasActive = true
-        // Resume web view process if it was suspended
-        webView.process?.resume()
+        // On macOS, we don't suspend/resume the web process like iOS
+        // The web view naturally uses less CPU when window is not key
     }
 
     @objc private func appWillResignActive() {
         wasActive = false
-        // Suspend web view process when app is not active to save CPU
-        // Only do this for remote servers; local server needs to stay responsive for herdr
-        if remoteServerId != nil {
-            webView.process?.suspend()
-        }
+        // On macOS, WKWebView doesn't expose process suspension
+        // The web view naturally uses less CPU when window is not key
+        // For remote servers, we could stop the web view's loading, but that would
+        // disconnect the WebSocket - so we just let it be
     }
 
     deinit {
@@ -279,7 +278,7 @@ final class WebPageController: NSObject, ObservableObject {
     }
 
     private func isOvis(_ origin: WKSecurityOrigin) -> Bool {
-        if let serverId = remoteServerId {
+        if remoteServerId != nil {
             guard origin.protocol.lowercased() == "https",
                   origin.host.lowercased() == "app.ovis.sh" else { return false }
             // For WKSecurityOrigin we can't easily check path, so we'll be more permissive

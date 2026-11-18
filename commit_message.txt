@@ -1,0 +1,60 @@
+Mac app: add remote Ovis session support, push notifications, and CPU optimizations
+
+## Summary
+This release adds the ability for the Mac app to connect to remote Ovis sessions
+running on servers (like the iOS app), receive push notifications when agents
+send alerts, and significantly reduces CPU usage when the app is in the
+background.
+
+## New Features
+
+### Remote Session Support (mirrors iOS app)
+- ServerStore.swift (new): Persistent storage for remote servers in
+  UserDefaults, parsing relay offer URLs with #offer= fragments
+- Model.swift:
+  - ServerKind enum (.local / .remote) with serverKind and remoteServer properties
+  - connectToRemoteServer() - verifies server via /api/health?scope=bridge
+  - switchToLocal() - returns to local herdr session
+  - removeRemoteServer() - removes saved server
+  - openRemoteOffer() - parses pairing links from other devices
+- OvisMacApp.swift: Server selector UI with "This Mac" button, saved remote
+  servers list, "+" button to add new servers via pairing link sheet
+- WebPage.swift: Scope-based navigation for remote servers
+  (https://app.ovis.sh/s/<server_id>/)
+
+### Push Notifications (mirrors iOS OvisPushPlugin)
+- PushKeyStore: Keychain storage for VAPID keys (P-256 + 16-byte auth)
+- subscribeToPush(): Registers with relay (https://push.ovis.sh/v1/register)
+  using APNs device token and VAPID public key from server
+- unsubscribeFromPush(): Removes subscription
+- togglePushNotifications(): Menu action to enable/disable
+- Fetches VAPID public key from /api/push/vapid endpoint
+- PushNotificationDelegate: Handles APNs token registration on macOS
+- entitlements: Added aps-environment for push support
+
+### CPU Efficiency Optimizations
+- Adaptive monitoring in Model.monitor():
+  - 3s polling when app is active
+  - 30s polling when app is in background
+  - Skips local server checks entirely when hidden (launch agent manages it)
+- WebView process suspension in WebPageController:
+  - Suspends web view process on resign active (remote servers only)
+  - Resumes on become active
+  - Observes NSApplication activation notifications
+
+## Files Changed
+- app/mac/Sources/OvisMac/ServerStore.swift (new)
+- app/mac/Sources/OvisMac/Model.swift
+- app/mac/Sources/OvisMac/OvisMacApp.swift
+- app/mac/Sources/OvisMac/WebPage.swift
+- app/mac/Ovis.entitlements (added aps-environment)
+
+## Usage
+1. Click "Add Remote Server..." or "+" button
+2. Paste pairing link from another device (e.g. https://app.ovis.sh/s/abc123/#offer=...)
+3. Optional: enter custom name
+4. App verifies server and switches to it
+5. Enable push notifications from View menu
+6. App automatically reduces CPU when in background
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
